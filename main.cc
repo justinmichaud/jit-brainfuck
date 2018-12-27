@@ -35,11 +35,12 @@ typedef struct REG_t {
 } REG;
 
 const REG RAX = { 0 };
-const REG RDI = { 0 };
-const REG RSI = { 0 };
-const REG RDX = { 0 };
-const REG RCX = { 0 };
-const REG SCRATCH[4] = { RDI, RSI, RDX, RCX };
+const REG RDI = { 0b0111 };
+const REG RSI = { 0b0110 };
+const REG RDX = { 0b0010 };
+const REG RCX = { 0b0001 };
+
+extern "C" { typedef uint64_t (*jit_fp)(register void*, register uint64_t, register uint64_t, register uint64_t); }
 
 class JITFn {
 	std::shared_ptr<JITFnBlock> block;
@@ -49,6 +50,7 @@ public:
 	void write(std::initializer_list<unsigned char>&& data)
 	{
 		for (auto c : data) {
+			printf("%02x", (int) c);
 			assert(end < block->end());
 			*end = c;
 			++end;
@@ -62,20 +64,71 @@ public:
 		end = start;
 	}
 
-	uint64_t operator()(uint64_t i)
+	void* current() const { return end; }
+
+	template <typename X>
+	uint64_t operator()(X* i)
 	{
-		return ((uint64_t (*)(uint64_t)) start)(i);
+		return ((jit_fp) start)((void*) i, 0, 0, 0);
 	}
 
 	void ret() { write({ 0xc3 }); }
-	void movq(REG dst, REG src) { write({ 0x48, 0x8B, (unsigned char) (0b11000000 | dst.val<<3 | src.val) }); }
-	void movq(REG dst, uint64_t src) { write({ 0x48, (unsigned char) (0xB8 | dst.val) }); for (size_t i=0; i<8; ++i) write({ (unsigned char) ((src>>(i*8))&0x00FF) }); }
+	void mov(REG dst, REG src) { write({ 0x48, 0x8B, (unsigned char) (0b11000000 | dst.val<<3 | src.val) }); }
+	void load(REG dst, uint64_t src) { write({ 0x48, (unsigned char) (0xB8 | dst.val) }); for (size_t i=0; i<8; ++i) write({ (unsigned char) ((src>>(i*8))&0x00FF) }); }
+	void load(REG dst, REG base, int8_t offset) { write({ 0x48, 0x8b, (unsigned char) (0b01000000 | dst.val<<3 | base.val), *reinterpret_cast<unsigned char*>(&offset) }); }
+	void store(REG base, int8_t offset, REG src) { write({ 0x48, 0x89, (unsigned char) (0b01000000 | src.val<<3 | base.val), *reinterpret_cast<unsigned char*>(&offset) });	}
+	void add(REG dst, REG src) { write({ 0x48, 0x01, (unsigned char) (0b11000000 | src.val<<3 | dst.val) }); };
+	void sub(REG dst, REG src) { write({ 0x48, 0x29, (unsigned char) (0b11000000 | src.val<<3 | dst.val) }); };
+
+	void cmp(REG r, uint8_t val) { write({ 0x48, 0x83, (unsigned char) (0b11111000 | r.val), val }); }
+	void je(uint8_t offset) { write({ 0x74, offset }); }
+	void jne(uint8_t offset) { write({ 0x75, offset }); }
+	void jmp(REG r) { write({ 0xFF, (unsigned char) (0b11100000 | r.val) }); }
+	void call(REG r) { write({ 0xFF, (unsigned char) (0b11010000 | r.val) }); }
+
+	void jump_if_equal(REG r, REG addr, uint8_t val) {
+		cmp(r, val);
+		jne(2);
+		jmp(addr);
+	}
+
+	char* make_patchpoint(REG dst) {
+		load(dst, 0);
+		return end - 8;
+	}
+
+	void patch(char* point, void* addr) {
+		uint64_t asInt = (uint64_t) addr;
+
+		for (size_t i=0; i<8; ++i)
+			point[i] = (char) ((asInt>>(i*8))&0x00FF);
+	}
+
 };
 
+uint64_t bf_print(char* data) {
+	std::cout << "BF output:\n";
+	std::cout << *data;
+	std::cout << "BF output done\n";
+	return 5;
+}
+
+// Calling convention: RAX - return
+// Input/scratch: RDI, RSI, RDX, RCX, ... (2 more) then stack
 void ident(JITFn& f)
 {
-	f.movq(RAX, 1234567890123456789);
+	std::cerr << "Emitting ident: \n";
+	f.load(RAX, RDI, 0);
+	f.load(RSI, 2);
+	f.add(RAX, RSI);
+	f.store(RDI, 0, RAX);
+
+	// TODO save / restore registers
+	f.load(RSI, (uint64_t) ((void*) bf_print));
+	f.call(RSI);
+	
 	f.ret();
+	std::cerr << "\n*****\n";
 }
 
 int main()
@@ -83,7 +136,12 @@ int main()
 	JITFn fn;
 	ident(fn);
 
-	for (int i=0; i<10; ++i)
-		std::cout << "f(" << i << ") = " << fn(i) << ";\n";
+	uint64_t val = 42;
+
+	std::cout << fn(&val) << "\n";
+	std::cout << val << "\n";
+
+	//for (int i=0; i<10; ++i)
+	//	std::cout << "f(" << i << ") = " << fn(i) << ";\n";
 	return 0;
 }
