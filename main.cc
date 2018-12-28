@@ -1,8 +1,15 @@
+#include <stack>
 #include <iostream>
 #include <stdlib.h>
+#include <map>
 #include <memory>
 #include <assert.h>
 #include <sys/mman.h>
+#include <fstream>
+#include <string>
+#include <streambuf>
+
+constexpr bool debug = false;
 
 class JITFnBlock {
 	char* block;
@@ -11,7 +18,7 @@ public:
 	JITFnBlock()
 	{
 		block = (char*) mmap(NULL,       // address
-                      4096*24,             // size
+                      4096*48,             // size
                       PROT_READ | PROT_WRITE | PROT_EXEC,
                       MAP_PRIVATE | MAP_ANONYMOUS,
                       -1,               // fd (not used here)
@@ -22,12 +29,12 @@ public:
 
 	~JITFnBlock()
 	{
-		munmap((void*) block, 4096*24);
+		munmap((void*) block, 4096*48);
 		block = nullptr;
 	}
 
 	char* begin() const { return block; }
-	char* end() const { return block + 4096*24; }
+	char* end() const { return block + 4096*48; }
 };
 
 typedef struct REG_t {
@@ -52,7 +59,7 @@ class JITFn {
 	inline void write(std::initializer_list<unsigned char>&& data)
 	{
 		for (auto c : data) {
-			printf("%02x", (int) c);
+			if (debug) printf("%02x", (int) c);
 			assert(end < block->end());
 			*end = c;
 			++end;
@@ -66,9 +73,10 @@ class JITFn {
 		end = start;
 	}
 
+public:
 	JITFn(const JITFn&) = delete;
 	JITFn(JITFn&&) = default;
-public:
+
 	JITFn()
 	{
 		block = std::make_shared<JITFnBlock>();
@@ -92,6 +100,16 @@ public:
 	void store(REG base, int8_t offset, REG src) { write({ 0x48, 0x89, (unsigned char) (0b01000000 | src.val<<3 | base.val), *reinterpret_cast<unsigned char*>(&offset) });	}
 	void add(REG dst, REG src) { write({ 0x48, 0x01, (unsigned char) (0b11000000 | src.val<<3 | dst.val) }); };
 	void sub(REG dst, REG src) { write({ 0x48, 0x29, (unsigned char) (0b11000000 | src.val<<3 | dst.val) }); };
+
+	void zero(REG dst) { write({ 0x48, 0x31, (unsigned char) (0b11000000 | dst.val<<3 | dst.val) }); }
+	void one(REG dst) { assert(dst.val == RAX.val || dst.val == RDX.val); zero(dst); loadb(dst, 1); } // Must have a low 8-bit register
+
+	// Byte versions of above:
+	void loadb(REG dst, uint8_t src) { write({ (unsigned char) (0xB0 | dst.val), src }); }
+	void loadb(REG dst, REG base, int8_t offset) { write({ 0x8a, (unsigned char) (0b01000000 | dst.val<<3 | base.val), *reinterpret_cast<unsigned char*>(&offset) }); }
+	void storeb(REG base, int8_t offset, REG src) { write({ 0x88, (unsigned char) (0b01000000 | src.val<<3 | base.val), *reinterpret_cast<unsigned char*>(&offset) }); }
+	void addb(REG dst, REG src) { write({ 0x00, (unsigned char) (0b11000000 | src.val<<3 | dst.val) }); };
+	void subb(REG dst, REG src) { write({ 0x28, (unsigned char) (0b11000000 | src.val<<3 | dst.val) }); };
 
 	void cmp(REG r, uint8_t val) { write({ 0x48, 0x83, (unsigned char) (0b11111000 | r.val), val }); }
 	void je(uint8_t offset) { write({ 0x74, offset }); }
@@ -121,7 +139,7 @@ public:
 	}
 
 	void prologue(const std::string& name) {
-		std::cerr << "Emitting " << name << ": \n";
+		if (debug) std::cerr << "Emitting " << name << ": \n";
         	push(RBP);
         	mov(RBP, RSP);
 	}
@@ -129,16 +147,19 @@ public:
 	void epilogue() {
 		pop(RBP);
         	ret();
-        	std::cerr << "\n*****\n";
+        	if (debug) std::cerr << "\n*****\n";
 	}
 };
 
 extern "C" uint64_t bf_print(register char* data) {
+	if (debug) std::cerr << "bf_print called with " << std::hex << reinterpret_cast<uint64_t>(data) << " containing " << (uint64_t) (*data) << "\n";
 	std::cout << *data;
+	std::cout.flush();
 	return 0;
 }
 
 extern "C" uint64_t bf_input(register char* data) {
+	if (debug) std::cerr << "bf_input called\n";
         std::cin >> *data;
         return 0;
 }
@@ -151,51 +172,55 @@ extern "C" uint64_t bf_input(register char* data) {
 void bf_jit_output(JITFn& f)
 {
 	f.push(RDI);
+	f.push(RAX); // Alignment
 	f.load(RAX, (uint64_t) ((void*) bf_print));
 	f.call(RAX);
+	f.pop(RAX);
 	f.pop(RDI);
 }
 
 void bf_jit_input(JITFn& f)
 {
         f.push(RDI);
+	f.push(RAX);
         f.load(RAX, (uint64_t) ((void*) bf_input));
         f.call(RAX);
+	f.pop(RAX);
         f.pop(RDI);
 }
 
 void bf_jit_inc_data(JITFn& f)
 {
-	f.load(RAX, RDI, 0);
-	f.load(RSI, 1);
-	f.add(RAX, RSI);
-	f.store(RDI, 0, RAX);
+	f.loadb(RAX, RDI, 0);
+	f.loadb(RSI, 1);
+	f.addb(RAX, RSI);
+	f.storeb(RDI, 0, RAX);
 }
 
 void bf_jit_inc_data_ptr(JITFn& f)
 {
-        f.load(RSI, 1);
-        f.add(RDI, RSI);
+        f.one(RDX);
+        f.add(RDI, RDX);
 }
 
 void bf_jit_dec_data(JITFn& f)
 {
-        f.load(RAX, RDI, 0);
-        f.load(RSI, 1);
-        f.sub(RAX, RSI);
-        f.store(RDI, 0, RAX);
+        f.loadb(RAX, RDI, 0);
+        f.loadb(RSI, 1);
+        f.subb(RAX, RSI);
+        f.storeb(RDI, 0, RAX);
 }
 
-void bf_jit_sub_data_ptr(JITFn& f)
+void bf_jit_dec_data_ptr(JITFn& f)
 {
-        f.load(RSI, 1);
-        f.sub(RDI, RSI);
+        f.one(RDX);
+        f.sub(RDI, RDX);
 }
 
 char* bf_jit_jump(JITFn& f, void* to)
 {
 	char* patch = f.make_patchpoint(RSI);
-	f.patch(patch, (void*) to);
+	f.patch(patch, to);
 	f.jmp(RSI);
 	return patch;
 }
@@ -203,30 +228,97 @@ char* bf_jit_jump(JITFn& f, void* to)
 char* bf_jit_jump_if_zero(JITFn& f, void* to)
 {
 	char* patch = f.make_patchpoint(RSI);
-	f.patch(patch, (void*) to);
-	f.load(RDX, RDI, 0);
+	f.patch(patch, to);
+	f.zero(RDX);
+	f.loadb(RDX, RDI, 0);
 	f.jump_if_equal(RDX, RSI, 0);
 	return patch;
 }
 
-int main()
+JITFn compile_bf(const std::string& program, const std::map<size_t, size_t>& brackets)
 {
-	JITFn fn;
-	fn.prologue("jit_entry");
-	auto* begin_loop = fn.current();
+	JITFn f;
+	f.prologue("jit_entry");
 
-	bf_jit_input(fn);
-	for (int i=0; i<'h'; ++i) bf_jit_dec_data(fn);
-	auto* end_loop_patch = bf_jit_jump_if_zero(fn, (void*)nullptr);
-	bf_jit_jump(fn, begin_loop);
+	std::map<size_t, char*> patches;
+	std::map<size_t, void*> addrs;
 
-	fn.patch(end_loop_patch, fn.current());
-	for (int i=0; i<'h'; ++i) bf_jit_inc_data(fn);
-	bf_jit_output(fn);
-	fn.epilogue();
+	for (size_t i = 0; i < program.length(); ++i) {
+		switch(program[i]) {
+		case '>':
+			bf_jit_inc_data_ptr(f);
+			break;
+		case '<':
+			bf_jit_dec_data_ptr(f);
+			break;
+		case '+':
+			bf_jit_inc_data(f);
+			break;
+		case '-':
+			bf_jit_dec_data(f);
+			break;
+		case '.':
+			bf_jit_output(f);
+			break;
+		case ',':
+			bf_jit_input(f);
+			break;
+		case '[':
+			addrs[i] = f.current();
+			patches[i] = bf_jit_jump_if_zero(f, nullptr);
+			break;
+		case ']':
+			patches[i] = bf_jit_jump(f, nullptr);
+			addrs[i] = f.current();
+			break;
+		}
+	}
 
-	uint64_t val = 0;
-	fn(&val);
+	for (auto pair : patches) {
+		f.patch(pair.second, addrs[brackets.at(pair.first)]);
+	}
 
+	f.epilogue();
+	return std::move(f);
+}
+
+int main(int argc, char** argv)
+{
+	if (argc != 2) {
+		std::cerr << "Must give bf file";
+		exit(1);
+	}
+	std::ifstream file(argv[1]);
+	std::string program((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	std::map<size_t, size_t> brackets;
+
+	std::stack<size_t> open;
+	for (size_t i=0; i<program.length(); ++i) {
+		switch(program[i]) {
+		case '[':
+			open.push(i);
+			break;
+		case ']':
+			brackets[open.top()] = i;
+			brackets[i] = open.top();
+			open.pop();
+			break;
+		}
+	}
+	if (!open.empty()) {
+		std::cerr << "Mismatched brackets";
+		exit(1);
+	}
+
+	JITFn jit_entry = compile_bf(program, brackets);
+
+	char* memory = new char[30000];
+	for (size_t i=0; i<30000; ++i)
+		memory[i] = 0;
+	if (debug) std::cerr << "Memory is located at " << std::hex << reinterpret_cast<uint64_t>(memory) << "\n";
+	jit_entry(memory);
+	delete[] memory;
+
+	std::cout << "\n";
 	return 0;
 }
